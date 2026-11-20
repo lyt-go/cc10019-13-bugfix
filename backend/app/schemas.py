@@ -357,6 +357,8 @@ class BehaviorHeatmapEntry(BaseModel):
     spatial_dim: str = Field(..., description="空间维度：page/region/element")
     agg_grain: str = Field(..., description="聚合粒度")
     color_scale: str = Field(..., description="色阶规则")
+    metric: str = Field("", description="口径：uv（独立人数）/count（页面次数），留空时按可用聚合推断")
+    source_config_id: str = Field("", description="指定消费的聚合配置编号，留空时按口径自动匹配")
     output_image: str = Field("", description="输出图片路径")
     refresh_freq: str = Field(..., description="刷新频率")
 
@@ -381,9 +383,14 @@ class AggResult(BaseModel):
     config_id: str
     event_id: str
     agg_dimensions: list[str]
+    agg_function: str = ""
     time_grain: str
     result_rows: list[dict[str, Any]] = Field(default_factory=list)
     total_count: int = 0
+    coverage: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="各聚合维度的覆盖范围：全集、已交付、缺失",
+    )
     output_table: str = ""
 
 

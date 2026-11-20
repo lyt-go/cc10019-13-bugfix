@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import copy
+import threading
 from typing import Any
 
 from app.seed import SEED_ROWS
@@ -11,11 +13,16 @@ from app.seed import SEED_ROWS
 
 class Store:
     def __init__(self) -> None:
+        # 同步锁：FastAPI 的同步路由运行在线程池里，聚合补算与热力查询可能并发。
+        # 产物读写与版本号递增必须在同一把锁内完成，避免下游读到“半份”结果。
+        self._lock = threading.RLock()
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
         # 数据产物存储：跨模块共享的数据结果
         self._artifacts: dict[str, dict[str, Any]] = {}
+        # 产物版本号：每次写入自增，消费方用它判断是否需要重算派生结果
+        self._artifact_revisions: dict[str, int] = {}
         # 版本快照
         self._snapshots: dict[str, list[dict[str, Any]]] = {}
         # 计算结果缓存
@@ -91,23 +98,47 @@ class Store:
         return {"cards": cards, "modules": modules}
 
     # ========== 数据产物管理 ==========
-    def set_artifact(self, artifact_type: str, artifact_id: str, data: dict[str, Any]) -> None:
-        """存储跨模块数据产物。"""
-        if artifact_type not in self._artifacts:
-            self._artifacts[artifact_type] = {}
-        self._artifacts[artifact_type][artifact_id] = data
+    def set_artifact(self, artifact_type: str, artifact_id: str, data: dict[str, Any]) -> int:
+        """存储跨模块数据产物，并返回写入后的版本号。
+
+        写入与版本号递增在同一把锁内完成；同时把快照写进产物本身，
+        并发读取时拿到的一定是一份完整且自洽的结果。
+        """
+        with self._lock:
+            if artifact_type not in self._artifacts:
+                self._artifacts[artifact_type] = {}
+            revision = self._artifact_revisions.get(artifact_type, 0) + 1
+            self._artifact_revisions[artifact_type] = revision
+            stored = copy.deepcopy(data)
+            stored.setdefault("revision", revision)
+            self._artifacts[artifact_type][artifact_id] = stored
+            return revision
 
     def get_artifact(self, artifact_type: str, artifact_id: str) -> dict[str, Any] | None:
-        """获取跨模块数据产物。"""
-        return self._artifacts.get(artifact_type, {}).get(artifact_id)
+        """获取跨模块数据产物（返回副本，避免调用方改坏已发布的版本）。"""
+        with self._lock:
+            artifact = self._artifacts.get(artifact_type, {}).get(artifact_id)
+            return copy.deepcopy(artifact) if artifact is not None else None
 
     def list_artifacts(self, artifact_type: str) -> list[dict[str, Any]]:
-        """列出某类型的所有产物。"""
-        return list(self._artifacts.get(artifact_type, {}).values())
+        """列出某类型的所有产物（副本）。"""
+        with self._lock:
+            return copy.deepcopy(list(self._artifacts.get(artifact_type, {}).values()))
 
     def get_artifact_keys(self, artifact_type: str) -> list[str]:
         """获取某类型产物的所有键。"""
-        return list(self._artifacts.get(artifact_type, {}).keys())
+        with self._lock:
+            return list(self._artifacts.get(artifact_type, {}).keys())
+
+    def artifact_revision(self, artifact_type: str, artifact_id: str | None = None) -> int:
+        """读取产物版本号；指定 artifact_id 时只认该产物的版本。"""
+        with self._lock:
+            if artifact_id is None:
+                return self._artifact_revisions.get(artifact_type, 0)
+            artifact = self._artifacts.get(artifact_type, {}).get(artifact_id)
+            if artifact is None:
+                return 0
+            return int(artifact.get("revision", 0))
 
     # ========== 快照管理 ==========
     def add_snapshot(self, snapshot_type: str, data: dict[str, Any]) -> None:
